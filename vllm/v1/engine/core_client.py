@@ -439,8 +439,8 @@ class SyncMPClient(MPClient):
     def sleep(self, level: int = 1) -> None:
         self._call_utility("sleep", level)
 
-    def wake_up(self) -> None:
-        self._call_utility("wake_up")
+    def wake_up(self, tags: Optional[list[str]] = None) -> None:
+        self._call_utility("wake_up", tags)
 
     def is_sleeping(self) -> bool:
         return self._call_utility("is_sleeping")

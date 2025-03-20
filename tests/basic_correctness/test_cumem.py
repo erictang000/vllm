@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
 from vllm.device_allocator.cumem import CuMemAllocator
@@ -154,6 +155,69 @@ def test_end_to_end(monkeypatch: pytest.MonkeyPatch, model: str, use_v1: bool):
             assert used_bytes < 2 * GiB_bytes
 
         llm.wake_up()
+        output2 = llm.generate(prompt, sampling_params)
+
+        # cmp output
+        assert output[0].outputs[0].text == output2[0].outputs[0].text
+
+@create_new_process_for_each_test()
+@pytest.mark.parametrize(
+    "model, use_v1",
+    [
+        # sleep mode with safetensors
+        ("Qwen/Qwen2.5-0.5B", True),
+        # # sleep mode with pytorch checkpoint
+        # ("facebook/opt-125m", False),
+    ])
+def test_end_to_end_with_weights(monkeypatch: pytest.MonkeyPatch, model: str, use_v1: bool):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_USE_V1", "1" if use_v1 else "0")
+        free, total = torch.cuda.mem_get_info()
+        used_bytes_baseline = total - free  # in case other process is running
+        llm = LLM(model, enable_sleep_mode=True)
+        prompt = "How are you?"
+        sampling_params = SamplingParams(temperature=0, max_tokens=10)
+        output = llm.generate(prompt, sampling_params)
+
+        # the benefit of `llm.sleep(level=2)` is mainly CPU memory usage,
+        # which is difficult to measure in the test. therefore, we only
+        # test sleep level 1 here.
+        llm.sleep(level=1)
+
+        free_gpu_bytes_after_sleep, total = torch.cuda.mem_get_info()
+        used_bytes = total - free_gpu_bytes_after_sleep - used_bytes_baseline
+        # now the memory usage is mostly cudagraph memory pool,
+        # and it should be less than the model weights (1B model, 2GiB weights)
+
+        # NOTE: In V1, the memory buffer for logits (max_num_reqs x vocab_size)
+        # is captured but cannot be releasesd from PyTorch due to a known bug,
+        # therefore high memory usage after `llm.sleep` is called is expected.
+        # FIXME(youkaichao & ywang96): Fix memory buffer issue with sleep mode
+        # in V1.
+        if use_v1:
+            assert used_bytes < 8 * GiB_bytes
+        else:
+            assert used_bytes < 3 * GiB_bytes
+
+        llm.wake_up(tags=["weights"])
+
+        # llm.inplace_update_weights(model)
+
+        model = AutoModelForCausalLM.from_pretrained(model).to("cuda")
+        # load weights
+        if use_v1:
+            breakpoint()
+            llm.llm_engine.model_executor.driver_worker.worker.model_runner.model.load_weights([(name, param) for name, param in  model.state_dict().items()])
+        else:
+            llm.llm_engine.model_executor.driver_worker.worker.model_runner.model.load_weights([(name, param) for name, param in  model.state_dict().items()])
+        # clear memory now that we loaded weights!
+        del model
+        torch.cuda.empty_cache()
+
+        # add check here for memory usage
+
+        # now allocate kv cache memory
+        llm.wake_up(tags=["kv_cache"])
         output2 = llm.generate(prompt, sampling_params)
 
         # cmp output
